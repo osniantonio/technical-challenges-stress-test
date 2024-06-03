@@ -1,32 +1,35 @@
 package stresser
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"os"
 	"sync"
-	"text/tabwriter"
 	"text/template"
 	"time"
 )
 
 var (
-	reportTempl = `Results
-Concurrency level:          {{.ConcLevel}}
-Time taken for tests:       {{.TimeTaken | printf "%.2f"}} seconds
-Total of required requests: {{.Total}}
-Total of done requests:     {{.Done}}
-Errored requests:           {{.Errors}}
-Successfully requests:      {{.Success}}
-Unsuccessfully requests:
-
+	reportTempl = `
+Results:
+Concurrency level:                       {{.ConcLevel}}
+Total time spent executing:              {{.TimeTaken | printf "%.2f"}} seconds
+Total number of requests made:           {{.Total}}
+Number of requests with HTTP status 200: {{.Success}}
+Errored requests:                        {{.Errors}}
+Distribution of other HTTP status codes (such as 404, 500, etc.):
+{{range $code, $count := .StatusCodes }}
+    {{$code}}: {{$count}}
+{{end}}
 `
 )
 
 type Options struct {
-	URL   string
-	Total int
-	Conc  int
+	URL      string
+	Total    int
+	Conc     int
+	Insecure bool
 }
 
 type result struct {
@@ -35,12 +38,12 @@ type result struct {
 }
 
 type report struct {
-	ConcLevel int
-	Total     int
-	Done      int
-	TimeTaken float64
-	Errors    int
-	Success   int
+	ConcLevel   int
+	Total       int
+	Success     int
+	Errors      int
+	TimeTaken   float64
+	StatusCodes map[int]int
 }
 
 type Stresser struct {
@@ -58,7 +61,7 @@ func NewStresser(opts *Options) *Stresser {
 	return &Stresser{
 		opts:         opts,
 		wg:           &sync.WaitGroup{},
-		reqChan:      make(chan struct{}, opts.Conc),
+		reqChan:      make(chan struct{}, opts.Total),
 		resChan:      make(chan *result, opts.Total),
 		done:         make(chan struct{}),
 		statsCounter: make(map[int]int),
@@ -66,32 +69,40 @@ func NewStresser(opts *Options) *Stresser {
 	}
 }
 
-func (s *Stresser) Exec() {
+func (s *Stresser) Execute() {
 	start := time.Now()
-	go s.start()
-	go s.execReq()
-	go s.saveRes()
+	s.wg.Add(s.opts.Total)
+	go s.beforeRun()
+	go s.runRequests()
+	go s.getResponse()
 	<-s.done
 	end := time.Now()
 	s.execTime = end.Sub(start)
 }
 
-func (s *Stresser) start() {
-	s.wg.Add(s.opts.Total)
-	for range s.opts.Total {
+func (s *Stresser) beforeRun() {
+	fmt.Println("Preparing requests...")
+	s.reqChan <- struct{}{}
+	for range s.opts.Total - 1 {
 		s.reqChan <- struct{}{}
 	}
-	s.wg.Wait()
 	close(s.reqChan)
+	fmt.Println("Requests prepared.")
 }
 
-func (s *Stresser) execReq() {
+func (s *Stresser) runRequests() {
+	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	fmt.Println("Sending requests...")
 	for {
-		<-s.reqChan
+		_, more := <-s.reqChan
+		if !more {
+			break
+		}
 		go func() {
 			defer s.wg.Done()
 			res, err := http.Get(s.opts.URL)
 			if err != nil {
+				fmt.Printf("Error: %v\n", err)
 				s.resChan <- &result{err: err}
 				return
 			}
@@ -99,9 +110,11 @@ func (s *Stresser) execReq() {
 			s.resChan <- &result{code: res.StatusCode}
 		}()
 	}
+	fmt.Println("All requests sent.")
 }
 
-func (s *Stresser) saveRes() {
+func (s *Stresser) getResponse() {
+	fmt.Println("Receiving responses...")
 	for range s.opts.Total {
 		res := <-s.resChan
 		if res.err != nil {
@@ -113,38 +126,40 @@ func (s *Stresser) saveRes() {
 		}
 		s.statsCounter[res.code]++
 	}
+	fmt.Println("All responses received.")
 	close(s.resChan)
 	s.done <- struct{}{}
 }
 
-func (s *Stresser) Report() {
-	report := &report{
-		ConcLevel: s.opts.Conc,
-		Total:     s.opts.Total,
-		Done:      s.opts.Total - s.errorCount,
-		TimeTaken: s.execTime.Seconds(),
-		Errors:    s.errorCount,
-		Success:   s.countSuccess(),
-	}
-	templ := template.Must(template.New("report").Parse(reportTempl))
-	templ.Execute(os.Stdout, report)
-	s.printFailures()
-}
+func (s *Stresser) ToReport() {
+	success := 0
+	otherStatus := make(map[int]int)
 
-func (s *Stresser) countSuccess() int {
-	if value, ok := s.statsCounter[http.StatusOK]; ok {
-		return value
-	}
-	return 0
-}
-
-func (s *Stresser) printFailures() {
-	w := tabwriter.NewWriter(os.Stdout, 4, 4, 4, ' ', 0)
-	fmt.Fprintln(w, "\tCode\tQuantity")
-	for k, v := range s.statsCounter {
-		if k != http.StatusOK {
-			fmt.Fprintf(w, "\t%v\t%v\n", k, v)
+	for code, count := range s.statsCounter {
+		if code == http.StatusOK {
+			success = count
+		} else {
+			otherStatus[code] = count
 		}
 	}
-	w.Flush()
+
+	report := &report{
+		ConcLevel:   s.opts.Conc,
+		Total:       s.opts.Total,
+		Success:     success,
+		Errors:      s.errorCount,
+		TimeTaken:   s.execTime.Seconds(),
+		StatusCodes: otherStatus,
+	}
+
+	templ := template.Must(template.New("report").Parse(reportTempl))
+	templ.Execute(os.Stdout, report)
+}
+
+func (s *Stresser) Start() {
+	fmt.Println("Starting stress test...")
+	go s.getResponse()
+	s.Execute()
+	<-s.done
+	fmt.Println("Stress test completed.")
 }

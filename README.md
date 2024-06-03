@@ -26,5 +26,15 @@ Distribuição de outros códigos de status HTTP (como 404, 500, etc.).
 
 ## Execução da aplicação:
 
-Poderemos utilizar essa aplicação fazendo uma chamada via docker. Ex:
-docker run osniantonio/stresstest —url=http://google.com —requests=1000 —concurrency=10
+Poderemos utilizar essa aplicação fazendo uma chamada via docker.
+
+```sh
+docker run osniantonio/stresstest:latest --url=http://google.com --requests=1000 --concurrency=10
+docker run osniantonio/stresstest:latest --url=http://reqres.in/api/users --requests=1000 --concurrency=10
+```
+
+Ou via make
+
+```sh
+make run
+```
